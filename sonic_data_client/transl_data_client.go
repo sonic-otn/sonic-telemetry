@@ -4,11 +4,14 @@ package client
 import (
 	spb "github.com/Azure/sonic-telemetry/proto"
 	transutil "github.com/Azure/sonic-telemetry/transl_utils"
-	log "github.com/golang/glog"
+	mapset "github.com/deckarep/golang-set"
+	"github.com/golang/glog"
 	"github.com/golang/protobuf/proto"
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
 	gnmi_extpb "github.com/openconfig/gnmi/proto/gnmi_ext"
 	"github.com/Workiva/go-datastructures/queue"
+	"github.com/openconfig/ygot/ygot"
+	"strconv"
 	"sync"
 	"time"
 	"fmt"
@@ -90,8 +93,8 @@ func (c *TranslClient) Get(w *sync.WaitGroup) ([]*spb.Value, error) {
 	/* The values structure at the end is returned and then updates in notitications as
 	specified in the proto file in the server.go */
 
-	log.V(6).Infof("TranslClient : Getting #%v", values)
-	log.V(4).Infof("TranslClient :Get done, total time taken: %v ms", int64(time.Since(ts)/time.Millisecond))
+	glog.V(2).Infof("TranslClient : Getting #%v", values)
+	glog.V(1).Infof("TranslClient :Get done, total time taken: %v ms", int64(time.Since(ts)/time.Millisecond))
 
 	return values, nil
 }
@@ -140,6 +143,11 @@ type ticker_info struct{
 	heartbeat      bool
 }
 
+func UpdatePrefixOriginByHostname(prefix *gnmipb.Path) {
+	hostname := translib.GetSystemHostname()
+	prefix.Origin = hostname
+}
+
 func (c *TranslClient) StreamRun(q *queue.PriorityQueue, stop chan struct{}, w *sync.WaitGroup, subscribe *gnmipb.SubscriptionList) {
 	rc, ctx := common_utils.GetContext(c.ctx)
 	c.ctx = ctx
@@ -169,7 +177,7 @@ func (c *TranslClient) StreamRun(q *queue.PriorityQueue, stop chan struct{}, w *
 	valueCache := make(map[string]string)
 
 	for i,sub := range subscribe.Subscription {
-		fmt.Println(sub.Mode, sub.SampleInterval)
+		glog.V(1).Info(sub.Mode, sub.SampleInterval)
 		switch sub.Mode {
 
 		case gnmipb.SubscriptionMode_TARGET_DEFINED:
@@ -204,11 +212,11 @@ func (c *TranslClient) StreamRun(q *queue.PriorityQueue, stop chan struct{}, w *
 				return
 			}
 		default:
-			log.V(1).Infof("Bad Subscription Mode for client %s ", c)
+			glog.Errorf("Bad Subscription Mode for client %s ", c)
 			enqueFatalMsgTranslib(c, fmt.Sprintf("Invalid Subscription Mode %d", sub.Mode))
 			return
 		}
-		fmt.Println("subscribe_mode:", subscribe_mode)
+		glog.V(1).Info("subscribe_mode:", subscribe_mode)
 		if subscribe_mode == gnmipb.SubscriptionMode_SAMPLE {
 			interval := int(sub.SampleInterval)
 			if interval == 0 {
@@ -218,22 +226,6 @@ func (c *TranslClient) StreamRun(q *queue.PriorityQueue, stop chan struct{}, w *
 					enqueFatalMsgTranslib(c, fmt.Sprintf("Invalid Sample Interval %ds, minimum interval is %ds", interval/int(time.Second), subSupport[i].MinInterval))
 					return
 				}
-			}
-			if !subscribe.UpdatesOnly {
-				//Send initial data now so we can send sync response.
-				val, err := transutil.TranslProcessGet(c.path2URI[sub.Path], nil, c.ctx)
-				if err != nil {
-					return
-				}
-				spbv := &spb.Value{
-					Prefix:       c.prefix,
-					Path:         sub.Path,
-					Timestamp:    time.Now().UnixNano(),
-					SyncResponse: false,
-					Val:          val,
-				}
-				c.q.Put(Value{spbv})
-				valueCache[c.path2URI[sub.Path]] = string(val.GetJsonIetfVal())
 			}
 
 			addTimer(c, ticker_map, &cases, cases_map, interval, sub, false)
@@ -245,6 +237,41 @@ func (c *TranslClient) StreamRun(q *queue.PriorityQueue, stop chan struct{}, w *
 					return
 				}
 				addTimer(c, ticker_map, &cases, cases_map, int(sub.HeartbeatInterval), sub, true)
+			}
+
+			if !subscribe.UpdatesOnly {
+				//Send initial data now so we can send sync response.
+				val, err := transutil.TranslProcessGetRegex(c.path2URI[sub.Path], c.ctx)
+				if err != nil {
+					// process the rest of subscriptions while one query failed
+					glog.Errorf("get regex for %s failed as %v", c.path2URI[sub.Path], err)
+					continue
+				}
+
+				if len(val) == 0 {
+					continue
+				}
+
+				UpdatePrefixOriginByHostname(c.prefix)
+				var regexValues RegexValues
+				regexValues.values = mapset.NewSet()
+				for _, iter := range val {
+					path, err := ygot.StringToStructuredPath(iter.Path)
+					if err != nil {
+						glog.Errorf("generate gnmipb.Path from path %s failed", iter.Path)
+						return
+					}
+					spbv := &spb.Value{
+						Prefix:       c.prefix,
+						Path:         path,
+						Timestamp:    time.Now().UnixNano(),
+						SyncResponse: false,
+						Val:          iter.TypedValue,
+					}
+					regexValues.values.Add(spbv)
+					valueCache[c.path2URI[sub.Path]] = string(iter.TypedValue.GetJsonIetfVal())
+				}
+				c.q.Put(regexValues)
 			}
 		} else if subscribe_mode == gnmipb.SubscriptionMode_ON_CHANGE {
 			onChangeSubsString = append(onChangeSubsString, c.path2URI[sub.Path])
@@ -278,36 +305,49 @@ func (c *TranslClient) StreamRun(q *queue.PriorityQueue, stop chan struct{}, w *
 
 	for {
 		chosen, _, ok := reflect.Select(cases)
-
-
 		if !ok {
 			return
 		}
 
+		UpdatePrefixOriginByHostname(c.prefix)
 		for _,tick := range ticker_map[cases_map[chosen]] {
-			fmt.Printf("tick, heartbeat: %t, path: %s", tick.heartbeat, c.path2URI[tick.sub.Path])
-			val, err := transutil.TranslProcessGet(c.path2URI[tick.sub.Path], nil, c.ctx)
+			glog.Infof("!!!tick, heartbeat: %t, path: %s\n", tick.heartbeat, c.path2URI[tick.sub.Path])
+			val, err := transutil.TranslProcessGetRegex(c.path2URI[tick.sub.Path], c.ctx)
 			if err != nil {
-				return
+				glog.Errorf("get regex for %s failed as %v", c.path2URI[tick.sub.Path], err)
+				continue
 			}
-			spbv := &spb.Value{
-				Prefix:       c.prefix,
-				Path:         tick.sub.Path,
-				Timestamp:    time.Now().UnixNano(),
-				SyncResponse: false,
-				Val:          val,
-			}
-			
 
-			if (tick.sub.SuppressRedundant) && (!tick.heartbeat) && (string(val.GetJsonIetfVal()) == valueCache[c.path2URI[tick.sub.Path]]) {
-				log.V(6).Infof("Redundant Message Suppressed #%v", string(val.GetJsonIetfVal()))
-			} else {
-				c.q.Put(Value{spbv})
-				valueCache[c.path2URI[tick.sub.Path]] = string(val.GetJsonIetfVal())
-				log.V(6).Infof("Added spbv #%v", spbv)
+			if len(val) == 0 {
+				continue
 			}
-			
-			
+
+			var regexValues RegexValues
+			regexValues.values = mapset.NewSet()
+			for _, iter := range val {
+				path, err := ygot.StringToStructuredPath(iter.Path)
+				if err != nil {
+					glog.Errorf("generate gnmipb.Path from path %s failed", iter.Path)
+					continue
+				}
+				spbv := &spb.Value{
+					Prefix:       c.prefix,
+					Path:         path,
+					Timestamp:    time.Now().UnixNano(),
+					SyncResponse: false,
+					Val:          iter.TypedValue,
+				}
+
+				if (tick.sub.SuppressRedundant) && (!tick.heartbeat) && (string(iter.TypedValue.GetJsonIetfVal()) == valueCache[c.path2URI[tick.sub.Path]]) {
+					glog.V(1).Infof("Redundant Message Suppressed #%v", string(iter.TypedValue.GetJsonIetfVal()))
+					continue
+				}
+
+				valueCache[c.path2URI[tick.sub.Path]] = string(iter.TypedValue.GetJsonIetfVal())
+				glog.V(2).Infof("Added spbv #%v", spbv)
+				regexValues.values.Add(spbv)
+			}
+			c.q.Put(regexValues)
 		}
 	}
 }
@@ -334,6 +374,72 @@ func addTimer(c *TranslClient, ticker_map map[int][]*ticker_info, cases *[]refle
 
 }
 
+func genGnmiPathKeyByPayload(payload []byte) map[string]string {
+	gnmiPathKey := make(map[string]string)
+	m := make(map[string]interface{})
+	err := json.Unmarshal(payload, &m)
+	if err != nil {
+		glog.Errorf("convert payload to map failed as %v", err)
+		return nil
+	}
+
+	for k, v := range m {
+		switch v.(type) {
+		case string:
+			val := v.(string)
+			gnmiPathKey[k] = val
+		case float64:
+			val := v.(float64)
+			strVal := strconv.FormatFloat(val, 'f', -1, 64)
+			gnmiPathKey[k] = strVal
+		default:
+			glog.Infof("convert payload field %s into gnmiPath key failed", k)
+		}
+	}
+
+	return gnmiPathKey
+}
+
+func constructSpbValueBySubRsp(subRsp *translib.SubscribeResponse) *spb.Value {
+	var prefix gnmipb.Path
+
+	UpdatePrefixOriginByHostname(&prefix)
+
+	path, err := ygot.StringToStructuredPath(subRsp.Path)
+	if err != nil {
+		glog.Errorf("generate gnmipb.Path from path %s failed", subRsp.Path)
+		return nil
+	}
+
+	var val *gnmipb.TypedValue
+	if subRsp.Payload != nil {
+		dst := new(bytes.Buffer)
+		json.Compact(dst, subRsp.Payload)
+		jv := dst.Bytes()
+
+		if subRsp.IsDeleted {
+			lastElem := path.Elem[len(path.Elem) - 1]
+			lastElem.Key = genGnmiPathKeyByPayload(jv)
+		} else {
+			/* Fill the values into GNMI data structures . */
+			val = &gnmipb.TypedValue{
+				Value: &gnmipb.TypedValue_JsonIetfVal{
+					JsonIetfVal: jv,
+				}}
+		}
+	}
+
+	spbv := &spb.Value{
+		Prefix:       &prefix,
+		Path:         path,
+		Timestamp:    subRsp.Timestamp,
+		SyncResponse: false,
+		Val:          val,
+	}
+
+	return spbv
+}
+
 func TranslSubscribe(gnmiPaths []*gnmipb.Path, stringPaths []string, pathMap map[string]*gnmipb.Path, c *TranslClient, updates_only bool) {
 	defer c.w.Done()
 	rc, ctx := common_utils.GetContext(c.ctx)
@@ -344,17 +450,21 @@ func TranslSubscribe(gnmiPaths []*gnmipb.Path, stringPaths []string, pathMap map
 	if rc.BundleVersion != nil {
 		nver, err := translib.NewVersion(*rc.BundleVersion)
 		if err != nil {
-			log.V(2).Infof("Subscribe operation failed with error =%v", err.Error())
+			glog.Errorf("Subscribe operation failed with error =%v", err.Error())
 			enqueFatalMsgTranslib(c, fmt.Sprintf("Subscribe operation failed with error =%v", err.Error()))
 			return
 		}
 		req.ClientVersion = nver
 	}
-	translib.Subscribe(req)
+	_, err := translib.Subscribe(req)
+	if err != nil {
+		glog.Errorf("translib subscribe failed %v", err)
+		return
+	}
 	for {
 		items, err := q.Get(1)
 		if err != nil {
-			log.V(1).Infof("%v", err)
+			glog.Errorf("%v", err)
 			return
 		}
 		switch v := items[0].(type) {
@@ -367,41 +477,28 @@ func TranslSubscribe(gnmiPaths []*gnmipb.Path, stringPaths []string, pathMap map
 				return
 			}
 
-			var jv []byte
-			dst := new(bytes.Buffer)
-			json.Compact(dst, v.Payload)
-			jv = dst.Bytes()
-
-			/* Fill the values into GNMI data structures . */
-			val := &gnmipb.TypedValue{
-				Value: &gnmipb.TypedValue_JsonIetfVal{
-				JsonIetfVal: jv,
-				}}
-
-			spbv := &spb.Value{
-				Prefix:       c.prefix,
-				Path:         pathMap[v.Path],
-				Timestamp:    v.Timestamp,
-				SyncResponse: false,
-				Val:          val,
+			spbv := constructSpbValueBySubRsp(v)
+			if spbv == nil {
+				glog.Errorf("generate gnmipb.Value for %s failed", v.Path)
+				continue
 			}
 
 			//Don't send initial update with full object if user wants updates only.
 			if updates_only && !sync_done {
-				log.V(1).Infof("Msg suppressed due to updates_only")
+				glog.V(1).Infof("Msg suppressed due to updates_only")
 			} else {
 				c.q.Put(Value{spbv})
 			}
 
-			log.V(6).Infof("Added spbv #%v", spbv)
+			glog.V(2).Infof("Added spbv #%v", spbv)
 			
 			if v.SyncComplete && !sync_done {
-				fmt.Println("SENDING SYNC")
+				glog.V(1).Info("SENDING SYNC")
 				c.synced.Done()
 				sync_done = true
 			}
 		default:
-			log.V(1).Infof("Unknown data type %v for %s in queue", items[0], c)
+			glog.V(1).Infof("Unknown data type %v for %s in queue", items[0], c)
 		}
 	}
 }
@@ -423,7 +520,7 @@ func (c *TranslClient) PollRun(q *queue.PriorityQueue, poll chan struct{}, w *sy
 	for {
 		_, more := <-c.channel
 		if !more {
-			log.V(1).Infof("%v poll channel closed, exiting pollDb routine", c)
+			glog.V(1).Infof("%v poll channel closed, exiting pollDb routine", c)
 			return
 		}
 		t1 := time.Now()
@@ -443,7 +540,7 @@ func (c *TranslClient) PollRun(q *queue.PriorityQueue, poll chan struct{}, w *sy
 				}
 
 				c.q.Put(Value{spbv})
-				log.V(6).Infof("Added spbv #%v", spbv)
+				glog.V(2).Infof("Added spbv #%v", spbv)
 			}
 		}
 
@@ -454,7 +551,7 @@ func (c *TranslClient) PollRun(q *queue.PriorityQueue, poll chan struct{}, w *sy
 			},
 		})
 		synced = true
-		log.V(4).Infof("Sync done, poll time taken: %v ms", int64(time.Since(t1)/time.Millisecond))
+		glog.V(1).Infof("Sync done, poll time taken: %v ms", int64(time.Since(t1)/time.Millisecond))
 	}
 }
 func (c *TranslClient) OnceRun(q *queue.PriorityQueue, once chan struct{}, w *sync.WaitGroup, subscribe *gnmipb.SubscriptionList) {
@@ -471,7 +568,7 @@ func (c *TranslClient) OnceRun(q *queue.PriorityQueue, once chan struct{}, w *sy
 	}
 	_, more := <-c.channel
 	if !more {
-		log.V(1).Infof("%v once channel closed, exiting onceDb routine", c)
+		glog.V(1).Infof("%v once channel closed, exiting onceDb routine", c)
 		return
 	}
 	t1 := time.Now()
@@ -491,7 +588,7 @@ func (c *TranslClient) OnceRun(q *queue.PriorityQueue, once chan struct{}, w *sy
 			}
 
 			c.q.Put(Value{spbv})
-			log.V(6).Infof("Added spbv #%v", spbv)
+			glog.V(2).Infof("Added spbv #%v", spbv)
 		}
 	}
 
@@ -501,7 +598,7 @@ func (c *TranslClient) OnceRun(q *queue.PriorityQueue, once chan struct{}, w *sy
 			SyncResponse: true,
 		},
 	})
-	log.V(4).Infof("Sync done, once time taken: %v ms", int64(time.Since(t1)/time.Millisecond))
+	glog.V(1).Infof("Sync done, once time taken: %v ms", int64(time.Since(t1)/time.Millisecond))
 	
 }
 

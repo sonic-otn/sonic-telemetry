@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	mapset "github.com/deckarep/golang-set"
 	"net"
 	"reflect"
 	"strconv"
@@ -59,7 +60,7 @@ type Stream interface {
 
 // Let it be variable visible to other packages for now.
 // May add an interface function for it.
-var UseRedisLocalTcpPort bool = false
+var UseRedisLocalTcpPort bool = true
 
 // redis client connected to each DB
 var Target2RedisDb = make(map[string]*redis.Client)
@@ -94,9 +95,38 @@ type Value struct {
 	*spb.Value
 }
 
+type RegexValues struct {
+	values mapset.Set
+}
+
 // Implement Compare method for priority queue
 func (val Value) Compare(other queue.Item) int {
-	oval := other.(Value)
+	oval, ok := other.(Value)
+	if !ok {
+		return 0
+	}
+	if val.GetTimestamp() > oval.GetTimestamp() {
+		return 1
+	} else if val.GetTimestamp() == oval.GetTimestamp() {
+		return 0
+	}
+	return -1
+}
+
+func (rvs RegexValues) Compare(other queue.Item) int {
+	orv, ok := other.(RegexValues)
+	if !ok {
+		return 0
+	}
+	ovals := orv.values.ToSlice()
+	vals := rvs.values.ToSlice()
+
+	if len(ovals) == 0 || len(vals) == 0 {
+		return 0
+	}
+
+	oval := ovals[0].(*spb.Value)
+	val := vals[0].(*spb.Value)
 	if val.GetTimestamp() > oval.GetTimestamp() {
 		return 1
 	} else if val.GetTimestamp() == oval.GetTimestamp() {
@@ -350,6 +380,18 @@ func ValToResp(val Value) (*gnmipb.SubscribeResponse, error) {
 			return nil, fmt.Errorf("%s", fatal)
 		}
 
+		if val.Val == nil {
+			return &gnmipb.SubscribeResponse{
+				Response: &gnmipb.SubscribeResponse_Update{
+					Update: &gnmipb.Notification{
+						Timestamp: val.GetTimestamp(),
+						Prefix:    val.GetPrefix(),
+						Delete: []*gnmipb.Path{val.GetPath()},
+					},
+				},
+			}, nil
+		}
+
 		return &gnmipb.SubscribeResponse{
 			Response: &gnmipb.SubscribeResponse_Update{
 				Update: &gnmipb.Notification{
@@ -365,6 +407,39 @@ func ValToResp(val Value) (*gnmipb.SubscribeResponse, error) {
 			},
 		}, nil
 	}
+}
+
+func ValuesToResp(rvs RegexValues) (*gnmipb.SubscribeResponse, error) {
+	update := &gnmipb.Notification{}
+	values := rvs.values.ToSlice()
+	for _, tmp := range values {
+		val := tmp.(*spb.Value)
+		// In case the subscribe/poll routines encountered fatal error
+		if fatal := val.GetFatal(); fatal != "" {
+			return nil, fmt.Errorf("%s", fatal)
+		}
+
+		update.Timestamp = val.Timestamp
+		update.Prefix = val.GetPrefix()
+		if val.Val == nil {
+			update.Delete = append(update.Delete, val.GetPath())
+		} else {
+			update.Update = append(update.Update, &gnmipb.Update{
+				Path:       val.GetPath(),
+				Val:        val.GetVal(),
+			})
+		}
+	}
+
+	if len(update.Update) == 0 {
+		return nil, fmt.Errorf("turn values into dialout response failed")
+	}
+
+	return &gnmipb.SubscribeResponse {
+		Response: &gnmipb.SubscribeResponse_Update {
+			Update: update,
+		},
+	}, nil
 }
 
 func GetTableKeySeparator(target string) (string, error) {
@@ -400,21 +475,29 @@ func useRedisTcpClient() {
 
 // Client package prepare redis clients to all DBs automatically
 func init() {
-	for dbName, dbn := range spb.Target_value {
-		if dbName != "OTHERS" {
-			// DB connector for direct redis operation
-			var redisDb *redis.Client
-
-			redisDb = redis.NewClient(&redis.Options{
-				Network:     "unix",
-				Addr:        sdcfg.GetDbSock(dbName),
-				Password:    "", // no password set
-				DB:          int(dbn),
-				DialTimeout: 0,
-			})
-			Target2RedisDb[dbName] = redisDb
-		}
-	}
+	//for dbName, dbn := range spb.Target_value {
+	//	if dbName != "OTHERS" {
+	//		// DB connector for direct redis operation
+	//		var redisDb *redis.Client
+	//
+	//		//redisDb = redis.NewClient(&redis.Options{
+	//		//	Network:     "unix",
+	//		//	Addr:        sdcfg.GetDbSock(dbName),
+	//		//	Password:    "", // no password set
+	//		//	DB:          int(dbn),
+	//		//	DialTimeout: 0,
+	//		//})
+	//
+	//		redisDb = redis.NewClient(&redis.Options{
+	//			Network:     "tcp",
+	//			Addr:        sdcfg.GetDbTcpAddr(dbName),
+	//			Password:    "", // no password set
+	//			DB:          int(dbn),
+	//			DialTimeout: 0,
+	//		})
+	//		Target2RedisDb[dbName] = redisDb
+	//	}
+	//}
 }
 
 // gnmiFullPath builds the full path from the prefix and path.
