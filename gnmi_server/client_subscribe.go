@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 
+        "github.com/Azure/sonic-telemetry/common_utils"
 	sdc "github.com/Azure/sonic-telemetry/sonic_data_client"
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
 )
@@ -123,7 +124,7 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer) (err error) {
 
 	if target == "OTHERS" {
 		dc, err = sdc.NewNonDbClient(paths, prefix)
-	} else if isTargetDb(target) == true {
+	} else if common_utils.IsTargetDb(target) == true {
 		dc, err = sdc.NewDbClient(paths, prefix)
 	} else {
 		/* For any other target or no target create new Transl Client. */

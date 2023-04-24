@@ -303,7 +303,7 @@ func (s *Server) Get(ctx context.Context, req *gnmipb.GetRequest) (*gnmipb.GetRe
 
 	if target == "OTHERS" {
 		dc, err = sdc.NewNonDbClient(paths, prefix)
-	} else if isTargetDb(target) == true {
+	} else if common_utils.IsTargetDb(target) == true {
 		dc, err = sdc.NewDbClient(paths, prefix)
 	} else {
 		/* If no prefix target is specified create new Transl Data Client . */
@@ -436,19 +436,5 @@ func (s *Server) Capabilities(ctx context.Context, req *gnmipb.CapabilityRequest
 				 	  SupportedEncodings: supportedEncodings,
 					  GNMIVersion: "0.7.0",
 					  Extension: exts}, nil
-}
-
-func  isTargetDb ( target string) (bool) {
-	isDbClient := false 
-	dbTargetSupported := []string { "APPL_DB", "ASIC_DB" , "COUNTERS_DB", "LOGLEVEL_DB", "CONFIG_DB", "PFC_WD_DB", "FLEX_COUNTER_DB", "STATE_DB"}
-
-	    for _, name := range  dbTargetSupported {
-		    if  target ==  name {
-			    isDbClient = true
-				    return isDbClient
-		    }
-	    }
-
-	    return isDbClient
 }
 

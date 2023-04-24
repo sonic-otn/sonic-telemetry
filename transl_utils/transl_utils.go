@@ -19,6 +19,11 @@ var (
     Writer *syslog.Writer
 )
 
+type GetTypedValue struct {
+	TypedValue *gnmipb.TypedValue
+	Path string
+}
+
 func __log_audit_msg(ctx context.Context, reqType string, uriPath string, err error) {
     var err1 error
     username := "invalid"
@@ -143,7 +148,48 @@ func TranslProcessGet(uriPath string, op *string, ctx context.Context) (*gnmipb.
 		Value: &gnmipb.TypedValue_JsonIetfVal{
 		JsonIetfVal: jv,
 		}}, nil
+}
 
+func TranslProcessGetRegex(uriPath string, ctx context.Context) ([]*GetTypedValue, error) {
+	var jv []byte
+	var tv []*GetTypedValue
+	rc, ctx := common_utils.GetContext(ctx)
+
+	req := translib.GetRequest{Path:uriPath, User: translib.UserRoles{Name: rc.Auth.User, Roles: rc.Auth.Roles}}
+	if rc.BundleVersion != nil {
+		nver, err := translib.NewVersion(*rc.BundleVersion)
+		if err != nil {
+			log.V(2).Infof("GET operation failed with error =%v", err.Error())
+			return nil, err
+		}
+		req.ClientVersion = nver
+	}
+	if rc.Auth.AuthEnabled {
+		req.AuthEnabled = true
+	}
+
+	regexResp, err := translib.GetRegex(req)
+	if err != nil {
+		log.V(2).Infof("GET operation failed with error =%v", err.Error())
+		return nil, err
+	}
+	for _, iter := range regexResp {
+		data := translib.FormatPayloadForGnmi(iter.Payload)
+		dst := new(bytes.Buffer)
+		json.Compact(dst, data)
+		jv = dst.Bytes()
+
+		tmp := &GetTypedValue{
+			TypedValue: &gnmipb.TypedValue{
+				Value: &gnmipb.TypedValue_JsonIetfVal{
+					JsonIetfVal: jv,
+				}},
+			Path: iter.Path,
+		}
+		tv = append(tv, tmp)
+	}
+
+	return tv, nil
 }
 
 /* Delete request handling. */

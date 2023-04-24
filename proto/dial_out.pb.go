@@ -117,7 +117,8 @@ func NewGNMIDialOutClient(cc *grpc.ClientConn) GNMIDialOutClient {
 }
 
 func (c *gNMIDialOutClient) Publish(ctx context.Context, opts ...grpc.CallOption) (GNMIDialOut_PublishClient, error) {
-	stream, err := grpc.NewClientStream(ctx, &_GNMIDialOut_serviceDesc.Streams[0], c.cc, "/gnmi.sonic.gNMIDialOut/Publish", opts...)
+	//stream, err := grpc.NewClientStream(ctx, &_GNMIDialOut_serviceDesc.Streams[0], c.cc, "/gnmi.sonic.gNMIDialOut/Publish", opts...)
+	stream, err := grpc.NewClientStream(ctx, &_GNMIDialOut_serviceDesc.Streams[0], c.cc, "/gnmi_dialout.gNMIDialout/Publish", opts...)
 	if err != nil {
 		return nil, err
 	}
