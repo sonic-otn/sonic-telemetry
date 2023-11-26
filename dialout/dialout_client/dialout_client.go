@@ -272,7 +272,7 @@ func newClient(ctx context.Context, dest Destination) (*Client, error) {
 
 	opts := []grpc.DialOption{
 		grpc.WithBlock(),
-		grpc.WithInsecure(),
+		//grpc.WithInsecure(),
 	}
 	if clientCfg.TLS != nil {
 		//opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(clientCfg.TLS)))
