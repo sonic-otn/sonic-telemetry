@@ -17,7 +17,7 @@ import (
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 
-	// "google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials"
 	"net"
 	//"reflect"
 	"strconv"
@@ -275,7 +275,7 @@ func newClient(ctx context.Context, dest Destination) (*Client, error) {
 		//grpc.WithInsecure(),
 	}
 	if clientCfg.TLS != nil {
-		//opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(clientCfg.TLS)))
+		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(clientCfg.TLS)))
 	}
 	conn, err := grpc.DialContext(ctx, dest.Addrs, opts...)
 	if err != nil {
